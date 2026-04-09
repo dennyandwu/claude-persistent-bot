@@ -1,7 +1,7 @@
 #!/bin/bash
 # Claude Code Persistent Bot Setup
 # 在新服务器上一键配置 Claude Code + Discord Bot 持久化运行环境
-# 用法: curl -sL <url> | bash  或  bash setup-persistent-bot.sh
+# 用法: curl -sL <url> | bash  或  bash setup.sh
 #
 # 幂等设计 — 重复运行安全，只更新有变化的部分。
 
@@ -10,6 +10,7 @@ set -euo pipefail
 CLAUDE_DIR="$HOME/.claude"
 COMMANDS_DIR="$CLAUDE_DIR/commands"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
+DISCORD_DIR="$CLAUDE_DIR/channels/discord"
 
 info()  { echo -e "\033[32m[OK]\033[0m $1"; }
 warn()  { echo -e "\033[33m[!!]\033[0m $1"; }
@@ -40,16 +41,96 @@ if ! command -v tmux &>/dev/null; then
 fi
 info "tmux $(tmux -V)"
 
+if ! command -v bun &>/dev/null; then
+  echo "  安装 bun（Discord 插件运行时）..."
+  curl -fsSL https://bun.sh/install | bash
+  export BUN_INSTALL="$HOME/.bun"
+  export PATH="$BUN_INSTALL/bin:$PATH"
+fi
+info "bun $(bun --version 2>/dev/null)"
+
 # ── 1. 目录结构 ──────────────────────────────────────────────
 
 step "创建目录结构"
 
-mkdir -p "$CLAUDE_DIR" "$COMMANDS_DIR" "$SYSTEMD_DIR"
+mkdir -p "$CLAUDE_DIR" "$COMMANDS_DIR" "$SYSTEMD_DIR" "$DISCORD_DIR"
 info "$CLAUDE_DIR"
 info "$COMMANDS_DIR"
 info "$SYSTEMD_DIR"
+info "$DISCORD_DIR"
 
-# ── 2. 启动脚本 ──────────────────────────────────────────────
+# ── 2. Discord 配置 ─────────────────────────────────────────
+
+step "配置 Discord"
+
+# .env — 不覆盖已有 token
+if [ ! -f "$DISCORD_DIR/.env" ]; then
+  cat > "$DISCORD_DIR/.env" << 'ENV'
+DISCORD_BOT_TOKEN=replace-with-your-discord-bot-token
+ENV
+  chmod 600 "$DISCORD_DIR/.env"
+  info ".env 模板已创建（需填入 bot token）"
+else
+  info ".env 已存在，跳过"
+fi
+
+# access.json — 不覆盖已有配置
+if [ ! -f "$DISCORD_DIR/access.json" ]; then
+  cat > "$DISCORD_DIR/access.json" << 'ACCESS'
+{
+  "dmPolicy": "pairing",
+  "allowFrom": [],
+  "groups": {},
+  "pending": {}
+}
+ACCESS
+  info "access.json 初始化（pairing 模式）"
+else
+  info "access.json 已存在，跳过"
+fi
+
+# inbox 目录 — 存放 Discord 附件下载
+mkdir -p "$DISCORD_DIR/inbox"
+info "inbox/"
+
+# settings.json — 合并 Discord 插件权限，不覆盖已有设置
+SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+if [ -f "$SETTINGS_FILE" ]; then
+  # 检查是否已包含 discord 权限
+  if ! grep -q 'mcp__plugin_discord_discord' "$SETTINGS_FILE" 2>/dev/null; then
+    warn "settings.json 已存在但未包含 Discord 权限，请手动添加："
+    echo '    "mcp__plugin_discord_discord__*" 到 permissions.allow 数组中'
+  else
+    info "settings.json 已包含 Discord 权限"
+  fi
+else
+  cat > "$SETTINGS_FILE" << 'SETTINGS'
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "mcp__plugin_discord_discord__*"
+    ],
+    "deny": [],
+    "defaultMode": "bypassPermissions"
+  },
+  "enabledPlugins": {
+    "discord@claude-plugins-official": true
+  },
+  "skipDangerousModePermissionPrompt": true
+}
+SETTINGS
+  info "settings.json 已创建（含 Discord 权限）"
+fi
+
+# ── 3. 启动脚本 ──────────────────────────────────────────────
 
 step "写入启动脚本"
 
@@ -71,12 +152,15 @@ export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 [ -s "$HOME/.fnm/fnm" ] && eval "$($HOME/.fnm/fnm env)"
 command -v mise &>/dev/null && eval "$(mise activate bash)"
 
+# Ensure bun is on PATH.
+[ -d "$HOME/.bun/bin" ] && export PATH="$HOME/.bun/bin:$PATH"
+
 tmux new-session -d -s "$SESSION" -x 200 -y 50 "claude --dangerously-skip-permissions"
 SCRIPT
 chmod +x "$CLAUDE_DIR/start-bot.sh"
 info "start-bot.sh"
 
-# ── 3. systemd user service ─────────────────────────────────
+# ── 4. systemd user service ─────────────────────────────────
 
 step "配置 systemd user service"
 
@@ -97,7 +181,7 @@ WantedBy=default.target
 EOF
 info "claude-bot.service"
 
-# ── 4. Enable lingering + service ────────────────────────────
+# ── 5. Enable lingering + service ────────────────────────────
 
 step "启用 lingering 和服务"
 
@@ -110,7 +194,7 @@ systemctl --user daemon-reload
 systemctl --user enable claude-bot.service 2>/dev/null
 info "service enabled"
 
-# ── 5. Slash 命令 ────────────────────────────────────────────
+# ── 6. Slash 命令 ────────────────────────────────────────────
 
 step "写入 slash 命令"
 
@@ -166,7 +250,7 @@ CMD
 
 info "bot-start / bot-stop / bot-restart / bot-status / bot-logs"
 
-# ── 6. 操作手册 ──────────────────────────────────────────────
+# ── 7. 操作手册 ──────────────────────────────────────────────
 
 step "写入操作手册"
 
@@ -248,19 +332,38 @@ echo "============================================"
 echo "  Setup complete!"
 echo "============================================"
 echo ""
-echo "  后续步骤："
-echo "  1. 配置 Discord bot token:"
-echo "     mkdir -p ~/.claude/channels/discord"
-echo "     echo 'DISCORD_BOT_TOKEN=你的token' > ~/.claude/channels/discord/.env"
-echo "     chmod 600 ~/.claude/channels/discord/.env"
-echo ""
-echo "  2. 安装 Discord 插件（在 claude 内）:"
-echo "     /install-plugin discord@claude-plugins-official"
-echo ""
-echo "  3. 启动 bot:"
-echo "     systemctl --user start claude-bot"
-echo "     或在 claude 内: /bot-start"
-echo ""
-echo "  4. 日常使用 claude 请通过 tmux:"
-echo "     tmux new -s work && claude"
+
+# 检查 Discord token 是否已配置
+if grep -q 'replace-with-your-discord-bot-token' "$DISCORD_DIR/.env" 2>/dev/null; then
+  echo "  ⚠️  Discord bot token 未配置！请完成以下步骤："
+  echo ""
+  echo "  1. 创建 Discord Bot（如果还没有）："
+  echo "     https://discord.com/developers/applications"
+  echo "     → New Application → Bot → Reset Token → 复制 token"
+  echo "     → Bot → 开启 Message Content Intent"
+  echo "     → OAuth2 → URL Generator → bot scope → 选择权限 → 邀请到服务器"
+  echo ""
+  echo "  2. 填入 token："
+  echo "     echo 'DISCORD_BOT_TOKEN=你的token' > ~/.claude/channels/discord/.env"
+  echo "     chmod 600 ~/.claude/channels/discord/.env"
+  echo ""
+  echo "  3. 安装 Discord 插件（在 claude 会话内）："
+  echo "     /plugin install discord@claude-plugins-official"
+  echo "     /reload-plugins"
+  echo ""
+  echo "  4. 配置 bot token（在 claude 会话内）："
+  echo "     /discord:configure 你的token"
+  echo ""
+  echo "  5. 启动 bot："
+  echo "     systemctl --user start claude-bot"
+  echo ""
+else
+  echo "  ✅ Discord token 已配置"
+  echo ""
+  echo "  启动 bot："
+  echo "     systemctl --user start claude-bot"
+  echo "     或在 claude 内: /bot-start"
+  echo ""
+fi
+echo "  📖 操作手册: ~/.claude/OPERATIONS.md"
 echo ""

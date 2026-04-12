@@ -91,19 +91,51 @@ From now on the bot auto-starts on boot and survives SSH disconnects.
 
 ```
 systemd (boot)
-  └── claude-bot.service
-        └── start-bot.sh
-              └── tmux session "claude-bot"
-                    └── claude --dangerously-skip-permissions
-                          └── Discord MCP server (bun)
-                                └── Discord Gateway (WebSocket)
+  ├── claude-bot.service            # Fresh session (Discord bot)
+  │     └── start-bot.sh
+  │           └── tmux session "claude-bot"
+  │                 └── claude --dangerously-skip-permissions
+  │                       └── Discord MCP server (bun)
+  │                             └── Discord Gateway (WebSocket)
+  └── claude-work.service          # Resume session (persistent work)
+        └── start-bot.sh (SESSION_NAME=work, RESUME_SESSION_ID=xxx)
+              └── tmux session "work"
+                    └── claude --dangerously-skip-permissions --resume --session-id xxx
 ```
+
+## systemd Services
+
+| Service | Description | Auto-enabled |
+|---------|-------------|--------------|
+| `claude-bot.service` | Starts a fresh Claude Code session as the Discord bot | Yes |
+| `claude-work.service` | Resumes a specific conversation on boot (set `RESUME_SESSION_ID`) | No — configure first |
+| `acpx-tunnel.service` | Reverse SSH tunnel to Mac Mini (ACPX bridge, optional) | Optional |
+| `elon2-sshfs.service` | SSHFS mount of Mac Mini OpenClaw workspace (depends on acpx-tunnel) | Optional |
+
+### Resume Mode (claude-work.service)
+
+`claude-work.service` uses the same `start-bot.sh` but passes two env vars that switch it into resume mode:
+
+```bash
+# Edit the service file to set your session ID:
+systemctl --user edit claude-work.service
+# Or edit directly: ~/.config/systemd/user/claude-work.service
+#
+# Set:
+#   Environment=SESSION_NAME=work
+#   Environment=RESUME_SESSION_ID=<your-session-id>
+
+# Then enable and start:
+systemctl --user enable --now claude-work.service
+```
+
+To find a session ID to resume, run inside Claude Code: `/session-id` or check `~/.claude/sessions/`.
 
 ## File Structure
 
 ```
 ~/.claude/
-├── start-bot.sh                    # Startup script (tmux + claude)
+├── start-bot.sh                    # Startup script (tmux + claude, dual-mode)
 ├── settings.json                   # Claude Code settings + Discord permissions
 ├── OPERATIONS.md                   # Operations manual
 ├── channels/
@@ -118,8 +150,81 @@ systemd (boot)
 │   ├── bot-status.md               # /bot-status
 │   └── bot-logs.md                 # /bot-logs
 ~/.config/systemd/user/
-└── claude-bot.service              # systemd user service
+├── claude-bot.service              # Fresh session (Discord bot)
+├── claude-work.service             # Resume session (work)
+├── acpx-tunnel.service             # ACPX reverse SSH tunnel (optional)
+└── elon2-sshfs.service             # Mac Mini SSHFS mount (optional)
 ```
+
+## ACPX Bridge (Optional)
+
+ACPX connects a remote Claude Code agent (this server) to an **OpenClaw Gateway** running on a Mac Mini via a reverse SSH tunnel. This lets Claude Code on the server act as a remote node — executing tasks in OpenClaw workspaces over SSH.
+
+### How it works
+
+```
+Server (this machine)
+  └── acpx-tunnel.service
+        └── autossh reverse tunnel → Mac Mini (:2222 → server :22)
+              └── OpenClaw Gateway (Mac Mini) calls back via tunnel
+                    └── Claude Code agent runs tasks in shared workspace
+elon2-sshfs.service (optional)
+  └── SSHFS mount: Mac Mini OpenClaw workspace → ~/elon2-workspace/openclaw/
+```
+
+### Setup with --with-acpx
+
+If you're setting up the ACPX bridge, after running `setup.sh`:
+
+1. Copy your SSH key for the Mac Mini to `~/.ssh/id_ed25519_macmini`
+2. Create `acpx-tunnel.service` pointing to your Mac Mini's Tailscale IP:
+
+```bash
+cat > ~/.config/systemd/user/acpx-tunnel.service << EOF
+[Unit]
+Description=ACPX Reverse SSH Tunnel to Mac Mini
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+ExecStart=/usr/bin/autossh -M 0 -N \
+  -o "ServerAliveInterval 30" -o "ServerAliveCountMax 3" \
+  -o "StrictHostKeyChecking no" \
+  -i $HOME/.ssh/id_ed25519_macmini \
+  -R 2222:127.0.0.1:22 <mac-mini-user>@<mac-mini-tailscale-ip>
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user enable --now acpx-tunnel.service
+```
+
+3. Optionally mount the OpenClaw workspace via SSHFS:
+
+```bash
+sudo apt-get install -y sshfs
+# Then create elon2-sshfs.service pointing to your workspace path
+```
+
+### Multi-Agent Config Isolation
+
+When running multiple Claude Code agents on the same server, isolate their configs using `CLAUDE_CONFIG_DIR`:
+
+```bash
+# Agent 1: Discord bot (uses default ~/.claude)
+claude --dangerously-skip-permissions
+
+# Agent 2: Work/ACPX agent (isolated config + workspace)
+CLAUDE_CONFIG_DIR=~/.claude-work claude --dangerously-skip-permissions
+
+# In systemd service, set:
+Environment=CLAUDE_CONFIG_DIR=/home/ubuntu/.claude-work
+```
+
+Each `CLAUDE_CONFIG_DIR` gets its own `settings.json`, `sessions/`, `commands/`, and `channels/` — agents don't share memory or session history.
 
 ## Slash Commands
 

@@ -136,13 +136,23 @@ step "写入启动脚本"
 
 cat > "$CLAUDE_DIR/start-bot.sh" << 'SCRIPT'
 #!/bin/bash
-SESSION="claude-bot"
+# Start Claude Code in a tmux session for persistent Discord bot operation.
+# Used by systemd service: claude-bot.service
+#
+# Supports two modes:
+#   SESSION_NAME=work RESUME_SESSION_ID=xxx  → resume a specific conversation
+#   (default)                                → start fresh as claude-bot
 
+SESSION="${SESSION_NAME:-claude-bot}"
+RESUME_ID="${RESUME_SESSION_ID:-}"
+
+# If the session already exists and claude is running inside, do nothing.
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   if tmux list-panes -t "$SESSION" -F '#{pane_current_command}' | grep -q claude; then
-    echo "claude-bot session already running"
+    echo "$SESSION session already running"
     exit 0
   fi
+  # Session exists but claude isn't running — kill and recreate.
   tmux kill-session -t "$SESSION"
 fi
 
@@ -155,7 +165,15 @@ command -v mise &>/dev/null && eval "$(mise activate bash)"
 # Ensure bun is on PATH.
 [ -d "$HOME/.bun/bin" ] && export PATH="$HOME/.bun/bin:$PATH"
 
-tmux new-session -d -s "$SESSION" -x 200 -y 50 "claude --dangerously-skip-permissions"
+# Build claude command
+if [ -n "$RESUME_ID" ]; then
+  CMD="claude --dangerously-skip-permissions --resume --session-id $RESUME_ID"
+else
+  CMD="claude --dangerously-skip-permissions"
+fi
+
+# Start tmux detached with claude running inside.
+tmux new-session -d -s "$SESSION" -x 200 -y 50 "$CMD"
 SCRIPT
 chmod +x "$CLAUDE_DIR/start-bot.sh"
 info "start-bot.sh"
@@ -181,6 +199,31 @@ WantedBy=default.target
 EOF
 info "claude-bot.service"
 
+# claude-work.service — resume a specific conversation on boot
+# Edit SESSION_NAME / RESUME_SESSION_ID to match your session before enabling.
+if [ ! -f "$SYSTEMD_DIR/claude-work.service" ]; then
+  cat > "$SYSTEMD_DIR/claude-work.service" << 'EOF'
+[Unit]
+Description=Claude Code Work Session (tmux, resume conversation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=SESSION_NAME=work
+Environment=RESUME_SESSION_ID=replace-with-session-id
+ExecStart=%h/.claude/start-bot.sh
+ExecStop=/usr/bin/tmux kill-session -t work
+
+[Install]
+WantedBy=default.target
+EOF
+  info "claude-work.service (template — fill in RESUME_SESSION_ID before enabling)"
+else
+  info "claude-work.service already exists, skipped"
+fi
+
 # ── 5. Enable lingering + service ────────────────────────────
 
 step "启用 lingering 和服务"
@@ -192,7 +235,8 @@ info "linger enabled"
 
 systemctl --user daemon-reload
 systemctl --user enable claude-bot.service 2>/dev/null
-info "service enabled"
+info "service enabled (claude-bot)"
+# claude-work.service is NOT auto-enabled — enable it manually after configuring RESUME_SESSION_ID
 
 # ── 6. Slash 命令 ────────────────────────────────────────────
 
